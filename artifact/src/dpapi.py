@@ -135,8 +135,8 @@ class DPAPI:
         return True
     
     def decrypt(self, blob: bytes) -> bytes:
-        pass
-    
+        ㅔㅁㄴㄴ
+
 
     def encrypt(self, blob: bytes) -> bytes:
         pass
