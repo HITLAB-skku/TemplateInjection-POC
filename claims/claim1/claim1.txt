@@ -4,3 +4,5 @@ The entire attack requires physical access to the device, so it cannot be execut
 The PoC script includes the part that creates an attacker's template — which is accepted by the victim's system — from data extracted from the victim's partition as described in the paper.
 
 In the actual attack we booted the victim device into a other bootable OS (ex. Windows PE)  and carried out that process, but for review purposes we assume certain files were already extracted and implemented the subsequent steps in code.
+
+Upon execution, the PoC produces a crafted biometric template. When this template is injected into the victim device’s WinBio database and a biometric authentication attempt is performed, the authentication is accepted and the system is successfully bypassed.
