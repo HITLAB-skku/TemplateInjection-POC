@@ -16,6 +16,9 @@ class DPAPI:
     CALG_SHA_256 = 0x800c
     CALG_SHA_512 = 0x800e
 
+    PK_ENTROPY = b"xT5rZW5qVVbrvpuA\x00"
+    PKP_ENTROPY = b"6jnkd5J3ZdQDtrsu\x00"
+
 
     def __init__(self):
         self.secrets = None
@@ -134,12 +137,190 @@ class DPAPI:
         self.masterkey = payload
         return True
     
-    def decrypt(self, blob: bytes) -> bytes:
-        ㅔㅁㄴㄴ
+    def _pkcs7_pad(b: bytes, block: int = 16) -> bytes:
+        padlen = block - (len(b) % block)
+        return b + bytes([padlen]) * padlen
 
 
-    def encrypt(self, blob: bytes) -> bytes:
-        pass
+    @staticmethod
+    def _hmac(key: bytes, data: bytes, algo: int) -> bytes:
+        if   algo == DPAPI.CALG_SHA1:    return HMAC.new(key, data, SHA1).digest()
+        elif algo == DPAPI.CALG_SHA_256: return HMAC.new(key, data, SHA256).digest()
+        elif algo == DPAPI.CALG_SHA_512: return HMAC.new(key, data, SHA512).digest()
+        else:                            return HMAC.new(key, data, SHA256).digest()
+
+
+    @staticmethod
+    def _hash_digest_size(algo: int) -> int:
+        return {DPAPI.CALG_SHA1:20, DPAPI.CALG_SHA_256:32, DPAPI.CALG_SHA_512:64}.get(algo, 32)
+
+
+    @staticmethod
+    def _pack_guid(guid_str: str) -> bytes:
+        p = guid_str.split("-")
+        part1 = int(p[0], 16)
+        part2 = int(p[1], 16)
+        part3 = int(p[2], 16)
+        part4 = [int(p[3][i:i+2], 16) for i in range(0, len(p[3]), 2)]
+        part5 = [int(p[4][i:i+2], 16) for i in range(0, len(p[4]), 2)]
+        return struct.pack("<L2H8B", part1, part2, part3, *part4, *part5)
+
+
+    @staticmethod
+    def _read_guid_le(buf: bytes, ofs: int):
+        (l, h1, h2, *b8) = struct.unpack_from("<L2H8B", buf, ofs)
+        ofs += struct.calcsize("<L2H8B")
+        guid = f"{l:08x}-{h1:04x}-{h2:04x}-{b8[0]:02x}{b8[1]:02x}-{b8[2]:02x}{b8[3]:02x}{b8[4]:02x}{b8[5]:02x}{b8[6]:02x}{b8[7]:02x}"
+        return guid, ofs
+    
+
+    @staticmethod
+    def _eat_len_bytes(buf: bytes, ofs: int):
+        (ln,) = struct.unpack_from("<L", buf, ofs); ofs += 4
+        data = buf[ofs:ofs+ln]; ofs += ln
+        return data, ofs
+
+
+    @staticmethod
+    def _derive_session_key(masterkey: bytes, salt: bytes, hash_alg: int,
+                            entropy: bytes|None, strong_password: bytes|None, smartcard_secret: bytes|None) -> bytes:
+        material = salt or b""
+        if entropy:          material += b"|E|" + entropy
+        if strong_password:  material += b"|P|" + strong_password
+        if smartcard_secret: material += b"|S|" + smartcard_secret
+        return DPAPI._hmac(masterkey, material, hash_alg)
+
+
+    @staticmethod
+    def _kdf_expand(session: bytes, out_len: int, hash_alg: int, info: bytes) -> bytes:
+        out, prev, ctr = b"", b"", 1
+        while len(out) < out_len:
+            prev = DPAPI._hmac(session, prev + info + bytes([ctr]), hash_alg)
+            out += prev
+            ctr += 1
+        return out[:out_len]
+
+
+    @staticmethod
+    def _parse_blob(raw: bytes):
+        ofs = 0
+        (version,) = struct.unpack_from("<L", raw, ofs); ofs += 4
+        provider_guid, ofs = DPAPI._read_guid_le(raw, ofs)
+
+        blob_start = ofs
+
+        (mkversion,) = struct.unpack_from("<L", raw, ofs); ofs += 4
+        mkguid, ofs = DPAPI._read_guid_le(raw, ofs)
+        (flags,) = struct.unpack_from("<L", raw, ofs); ofs += 4
+
+        descr_bytes, ofs = DPAPI._eat_len_bytes(raw, ofs)
+        try:
+            description_utf8 = descr_bytes.decode("UTF-16LE").encode("utf-8")
+        except Exception:
+            description_utf8 = b""
+
+        (cipher_alg_id,) = struct.unpack_from("<L", raw, ofs); ofs += 4
+        (key_len,)       = struct.unpack_from("<L", raw, ofs); ofs += 4
+        salt,   ofs = DPAPI._eat_len_bytes(raw, ofs)
+        strong, ofs = DPAPI._eat_len_bytes(raw, ofs)
+        (hash_alg_id,) = struct.unpack_from("<L", raw, ofs); ofs += 4
+        (hash_len,)    = struct.unpack_from("<L", raw, ofs); ofs += 4
+        hmac_data,   ofs = DPAPI._eat_len_bytes(raw, ofs)
+        cipher_text, ofs = DPAPI._eat_len_bytes(raw, ofs)
+
+        blob_for_hmac = raw[blob_start:ofs]
+        sign, ofs = DPAPI._eat_len_bytes(raw, ofs)
+
+        return {
+            "version": version,
+            "provider_guid": provider_guid,
+            "mkversion": mkversion,
+            "mkguid": mkguid,
+            "flags": flags,
+            "description_utf8": description_utf8,
+            "cipher_alg_id": cipher_alg_id,
+            "key_len": key_len,
+            "salt": salt,
+            "strong": strong,
+            "hash_alg_id": hash_alg_id,
+            "hash_len": hash_len,
+            "hmac_data": hmac_data,
+            "cipher_text": cipher_text,
+            "blob_for_hmac": blob_for_hmac,
+            "sign": sign,
+        }
+
+    @staticmethod
+    def _derive_keys(masterkey: bytes, salt: bytes, hash_alg_id: int,
+                     key_len: int,
+                     entropy: bytes|None, strong_password: bytes|None, smartcard_secret: bytes|None):
+        session = DPAPI._derive_session_key(masterkey, salt, hash_alg_id, entropy, strong_password, smartcard_secret)
+        enc_key  = DPAPI._kdf_expand(session, key_len or 32, hash_alg_id, b"DPAPI-CIPHER-KEY")
+        sign_key = DPAPI._kdf_expand(session, DPAPI._hash_digest_size(hash_alg_id), hash_alg_id, b"DPAPI-SIGN-KEY")
+        return enc_key, sign_key
+
+
+    def decrypt(self, blob: bytes,
+                *, entropy: bytes|None=None, strong_password: bytes|None=None, smartcard_secret: bytes|None=None) -> bytes:
+        if not hasattr(self, "masterkey") or self.masterkey is None:
+            raise DPAPIError("Masterkey not available. Call get_masterkey() first.")
+
+        b = self._parse_blob(blob)
+        enc_key, sign_key = self._derive_keys(self.masterkey, b["salt"], b["hash_alg_id"], b["key_len"],
+                                              entropy, strong_password, smartcard_secret)
+
+        iv = b"\x00" * 16
+        cipher = AES.new(enc_key[:32], AES.MODE_CBC, iv=iv)
+        pt = cipher.decrypt(b["cipher_text"])
+        try:
+            pt = unpad(pt, 16)
+        except ValueError as e:
+            raise DPAPIError(f"Invalid padding: {e}")
+
+        computed = self._hmac(sign_key, b["blob_for_hmac"], b["hash_alg_id"])
+        if computed[:len(b["sign"])] != b["sign"]:
+            raise DPAPIError("DPAPI HMAC verification failed")
+
+        return pt
+
+
+    def encrypt(self, template_blob: bytes, cleartext: bytes,
+                *, entropy: bytes|None=None, strong_password: bytes|None=None, smartcard_secret: bytes|None=None) -> bytes:
+        if not hasattr(self, "masterkey") or self.masterkey is None:
+            raise DPAPIError("Masterkey not available. Call get_masterkey() first.")
+
+        b = self._parse_blob(template_blob)
+        enc_key, sign_key = self._derive_keys(self.masterkey, b["salt"], b["hash_alg_id"], b["key_len"],
+                                              entropy, strong_password, smartcard_secret)
+
+        iv = b"\x00" * 16
+        ct = AES.new(enc_key[:32], AES.MODE_CBC, iv=iv).encrypt(self._pkcs7_pad(cleartext, 16))
+
+        out = bytearray()
+        out += struct.pack("<L", b["version"])
+        out += self._pack_guid(b["provider_guid"])
+        out += struct.pack("<L", b["mkversion"])
+        out += self._pack_guid(b["mkguid"])
+        out += struct.pack("<L", b["flags"])
+
+        descr_utf16 = b["description_utf8"].decode("utf-8").encode("UTF-16LE") if b["description_utf8"] else b""
+        out += struct.pack("<L", len(descr_utf16)) + descr_utf16
+
+        out += struct.pack("<L", b["cipher_alg_id"])
+        out += struct.pack("<L", b["key_len"])
+        out += struct.pack("<L", len(b["salt"])) + b["salt"]
+        out += struct.pack("<L", len(b["strong"])) + b["strong"]
+        out += struct.pack("<L", b["hash_alg_id"])
+        out += struct.pack("<L", b["hash_len"])
+        out += struct.pack("<L", len(b["hmac_data"])) + b["hmac_data"]
+
+        out += struct.pack("<L", len(ct)) + ct
+
+        blob_for_hmac = bytes(out)[4 + len(self._pack_guid(b["provider_guid"])):]
+        sign = self._hmac(sign_key, blob_for_hmac, b["hash_alg_id"])
+
+        out += struct.pack("<L", len(sign)) + sign
+        return bytes(out)
 
 
         
